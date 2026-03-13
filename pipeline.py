@@ -452,6 +452,93 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+# ── Claude report ingestion ────────────────────────────────────────────────────
+
+def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
+                         path: str, ingested: set):
+    """
+    Ingest a Claude-generated report (markdown or text file) into BQ + GCS.
+    conversation_id  = sha1 of the file path (stable across runs)
+    messages         = one row per ## section (or full text if no sections)
+    source           = "claude"
+    """
+    import hashlib
+
+    fpath = Path(path).expanduser().resolve()
+    if not fpath.exists():
+        print(f"[Claude report] File not found: {fpath}")
+        return
+
+    cid = "claude-" + hashlib.sha1(str(fpath).encode()).hexdigest()[:16]
+    if cid in ingested:
+        print(f"[Claude report] Already ingested: {fpath.name}")
+        return
+
+    print(f"\n[Claude report] Ingesting: {fpath.name}")
+    raw_text = fpath.read_text()
+
+    # Split into sections on ## headers; fall back to whole file as one section
+    import re
+    sections = re.split(r'\n(?=## )', raw_text)
+    if len(sections) <= 1:
+        sections = [raw_text]
+
+    # Build full text for enrichment (skip pipeline log lines at top)
+    enrichment_text = "\n\n".join(
+        s for s in sections
+        if not s.strip().startswith("[Planner]")
+        and not s.strip().startswith("[Research]")
+        and not s.strip().startswith("[Context]")
+        and not s.strip().startswith("[Analyst]")
+        and not s.strip().startswith("===")
+        and not s.strip().startswith("Request:")
+    )
+
+    print("  [Claude] enriching...")
+    meta = enrich(enrichment_text, fpath.stem.replace("_", " ").title())
+    print(f"    topic:     {meta.get('topic','')[:80]}")
+    print(f"    companies: {meta.get('companies')}")
+
+    # File mtime as the date
+    mtime = datetime.fromtimestamp(fpath.stat().st_mtime).isoformat() + "Z"
+
+    # Upload raw file to GCS
+    bucket = gcs.bucket(BUCKET)
+    if not bucket.exists():
+        bucket = gcs.create_bucket(BUCKET, location="US")
+    blob_name = f"transcripts/claude/{fpath.stem}.md"
+    bucket.blob(blob_name).upload_from_string(raw_text, content_type="text/markdown")
+    gcs_path = f"gs://{BUCKET}/{blob_name}"
+    print(f"  [GCS] {gcs_path}")
+
+    # messages: one per section, role = "assistant"
+    msg_rows = []
+    for i, section in enumerate(sections):
+        text = section.strip()
+        if not text:
+            continue
+        msg_rows.append({
+            "conversation_id": cid,
+            "timestamp":       mtime,
+            "role":            "assistant",
+            "content":         text,
+            "sequence":        i,
+            "word_count":      len(text.split()),
+        })
+
+    total_words = sum(r["word_count"] for r in msg_rows)
+
+    # Fake session dict for build_conv_row
+    session = {"startedAt": mtime, "endedAt": mtime, "title": fpath.stem.replace("_", " ").title()}
+    conv_row = build_conv_row(cid, session, meta, gcs_path, len(msg_rows), total_words)
+    conv_row["source"] = "claude"
+    conv_row["duration_minutes"] = None
+
+    batch_load(bq, "conversations", [conv_row])
+    batch_load(bq, "messages", msg_rows)
+    print(f"  Done — {len(msg_rows)} sections, {total_words} words")
+
+
 def run():
     print("=" * 60)
     print("PERSONAL ASSISTANT — CONVERSATION INGESTION PIPELINE")
@@ -467,11 +554,19 @@ def run():
 
     ingested = get_ingested_ids(bq)
     print(f"[BQ] Already ingested: {len(ingested)} conversations")
+
+    # Cluely
     ingest_cluely(bq, gcs, ingested)
+
+    # Claude reports: --report path/to/file.md
+    if "--report" in sys.argv:
+        idx = sys.argv.index("--report")
+        report_path = sys.argv[idx + 1]
+        ingest_claude_report(bq, gcs, report_path, ingested)
 
     print("\n" + "=" * 60)
     print("Sample query:")
-    print(f"  SELECT date, topic, participants, hiring_company, hiring_stage")
+    print(f"  SELECT date, source, topic, companies")
     print(f"  FROM `{PROJECT_ID}.{DATASET}.conversations`")
     print(f"  ORDER BY date DESC")
     print("=" * 60)
