@@ -34,9 +34,11 @@ CREDS_PATH   = Path(__file__).parent / "creds.json"
 PROJECT_ID   = "eng-reactor-287421"
 DATASET      = "personal_assistant"
 BUCKET       = "jesse-personal-assistant"
-CLUELY_SESSION_PATH  = Path.home() / "Library/Application Support/cluely/user.session"
+CLUELY_SESSION_PATH   = Path.home() / "Library/Application Support/cluely/user.session"
 GRANOLA_ACCOUNTS_PATH = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
-ANTHROPIC_MODEL      = "claude-sonnet-4-6"
+GDOCS_CLIENT_FILE     = Path(__file__).parent / "google_oauth_client.json"
+GDOCS_TOKEN_FILE      = Path(__file__).parent / "google_token.json"
+ANTHROPIC_MODEL       = "claude-sonnet-4-6"
 
 # ── GCP clients ────────────────────────────────────────────────────────────────
 
@@ -190,7 +192,7 @@ def enrich(transcript_text: str, title: str) -> dict:
     org_context = _load_org_context()
     resp = client.messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=2048,
+        max_tokens=4096,
         system=(
             "You are a conversation analyst. Extract structured metadata from transcripts.\n"
             "The transcript uses [mic] for the local speaker (Jesse Watson) and [system] for other speakers.\n"
@@ -201,7 +203,7 @@ def enrich(transcript_text: str, title: str) -> dict:
             + ENRICHMENT_SCHEMA
             + org_context
         ),
-        messages=[{"role": "user", "content": f"Title: {title}\n\nTranscript:\n{transcript_text[:14000]}"}],
+        messages=[{"role": "user", "content": f"Title: {title}\n\nTranscript:\n{transcript_text[:28000]}"}],
     )
     raw = resp.content[0].text.strip()
     # Strip accidental markdown fences
@@ -428,7 +430,7 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
     """Re-extract all metadata. Truncates and reloads conversations table."""
     print("\n[Re-enrich] Loading existing conversation IDs...")
     rows = list(bq.query(
-        f"SELECT conversation_id, title, source FROM `{PROJECT_ID}.{DATASET}.conversations`"
+        f"SELECT conversation_id, title, source, raw_gcs_path FROM `{PROJECT_ID}.{DATASET}.conversations`"
     ).result())
     print(f"[Re-enrich] {len(rows)} conversations to re-enrich")
 
@@ -436,19 +438,24 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
     new_conv_rows = []
 
     for row in rows:
-        sid    = row.conversation_id
-        title  = row.title or ""
-        source = row.source or "cluely"
+        sid      = row.conversation_id
+        title    = row.title or ""
+        source   = row.source or "cluely"
+        stored_gcs_path = row.raw_gcs_path or ""
         print(f"\n  Re-enriching [{source}]: {title or sid}")
 
-        # Locate the raw file in GCS — try source-specific path first
+        # Locate the raw file in GCS — use stored path first, then fallback candidates
         raw = None
         gcs_path = None
-        for candidate in [
+        candidates = []
+        if stored_gcs_path.startswith(f"gs://{BUCKET}/"):
+            candidates.append(stored_gcs_path[len(f"gs://{BUCKET}/"):])
+        candidates += [
             f"transcripts/{source}/{sid}.json",
             f"transcripts/{source}/{sid}.md",
             f"transcripts/cluely/{sid}.json",
-        ]:
+        ]
+        for candidate in candidates:
             blob = bucket.blob(candidate)
             try:
                 raw_text = blob.download_as_text()
@@ -636,6 +643,133 @@ def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set):
     print("\n[Granola] Done.")
 
 
+# ── Google Docs ingestion ──────────────────────────────────────────────────────
+
+GDOCS_SCOPES = [
+    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+
+def auth_google():
+    """One-time OAuth flow — opens browser, saves token to google_token.json."""
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(str(GDOCS_CLIENT_FILE), GDOCS_SCOPES)
+    creds = flow.run_local_server(port=0)
+    GDOCS_TOKEN_FILE.write_text(creds.to_json())
+    print(f"[Google] Token saved to {GDOCS_TOKEN_FILE}")
+
+
+def _gdocs_creds():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    if not GDOCS_TOKEN_FILE.exists():
+        raise EnvironmentError("No Google token found — run: python pipeline.py --auth-google")
+    creds = Credentials.from_authorized_user_file(str(GDOCS_TOKEN_FILE), GDOCS_SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        GDOCS_TOKEN_FILE.write_text(creds.to_json())
+    return creds
+
+
+def _doc_id_from_url(url: str) -> str:
+    import re
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if not m:
+        raise ValueError(f"Could not extract doc ID from URL: {url}")
+    return m.group(1)
+
+
+def fetch_gdoc_as_markdown(doc_id: str) -> tuple[str, str]:
+    """Returns (title, markdown_text) for a Google Doc."""
+    from googleapiclient.discovery import build
+    creds = _gdocs_creds()
+    service = build("docs", "v1", credentials=creds, cache_discovery=False)
+    doc = service.documents().get(documentId=doc_id).execute()
+    title = doc.get("title", "Untitled")
+
+    # Walk the document body and extract plain text
+    lines = []
+    for elem in doc.get("body", {}).get("content", []):
+        para = elem.get("paragraph")
+        if not para:
+            continue
+        style = para.get("paragraphStyle", {}).get("namedStyleType", "")
+        text = "".join(
+            r.get("textRun", {}).get("content", "")
+            for r in para.get("elements", [])
+        ).rstrip("\n")
+        if not text.strip():
+            lines.append("")
+            continue
+        if style == "HEADING_1":
+            lines.append(f"# {text}")
+        elif style == "HEADING_2":
+            lines.append(f"## {text}")
+        elif style == "HEADING_3":
+            lines.append(f"### {text}")
+        else:
+            lines.append(text)
+
+    return title, "\n".join(lines)
+
+
+def ingest_gdoc(bq: bigquery.Client, gcs: storage.Client, url: str, ingested: set):
+    import hashlib, re
+    doc_id = _doc_id_from_url(url)
+    cid = "gdoc-" + hashlib.sha1(doc_id.encode()).hexdigest()[:16]
+
+    if cid in ingested:
+        print(f"[GDoc] Already ingested: {doc_id}")
+        return
+
+    print(f"\n[GDoc] Fetching: {url}")
+    title, text = fetch_gdoc_as_markdown(doc_id)
+    print(f"  Title: {title}  ({len(text.split())} words)")
+
+    sections = re.split(r'\n(?=## )', text)
+    if len(sections) <= 1:
+        sections = [text]
+
+    print("  [Claude] enriching...")
+    meta = enrich(text[:14000], title)
+    print(f"    topic:     {meta.get('topic','')[:80]}")
+    print(f"    companies: {meta.get('companies')}")
+
+    # Upload raw to GCS
+    bucket = gcs.bucket(BUCKET)
+    blob_name = f"transcripts/gdoc/{doc_id}.md"
+    bucket.blob(blob_name).upload_from_string(text, content_type="text/markdown")
+    gcs_path = f"gs://{BUCKET}/{blob_name}"
+    print(f"  [GCS] {gcs_path}")
+
+    from datetime import timezone
+    now = datetime.now(timezone.utc).isoformat()
+    msg_rows = []
+    for i, section in enumerate(sections):
+        section = section.strip()
+        if not section:
+            continue
+        msg_rows.append({
+            "conversation_id": cid,
+            "timestamp":       now,
+            "role":            "assistant",
+            "content":         section,
+            "sequence":        i,
+            "word_count":      len(section.split()),
+        })
+
+    total_words = sum(r["word_count"] for r in msg_rows)
+    session = {"startedAt": now, "endedAt": now, "title": title}
+    conv_row = build_conv_row(cid, session, meta, gcs_path, len(msg_rows), total_words)
+    conv_row["source"] = "gdoc"
+    conv_row["duration_minutes"] = None
+
+    batch_load(bq, "conversations", [conv_row])
+    batch_load(bq, "messages", msg_rows)
+    print(f"  Done — {len(msg_rows)} sections, {total_words} words")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 # ── Claude report ingestion ────────────────────────────────────────────────────
@@ -747,11 +881,15 @@ def run():
     # Granola
     ingest_granola(bq, gcs, ingested)
 
-    # Claude reports: --report path/to/file.md
-    if "--report" in sys.argv:
-        idx = sys.argv.index("--report")
-        report_path = sys.argv[idx + 1]
-        ingest_claude_report(bq, gcs, report_path, ingested)
+    # Claude reports: --report path/to/file.md  (can repeat)
+    for i, arg in enumerate(sys.argv):
+        if arg == "--report" and i + 1 < len(sys.argv):
+            ingest_claude_report(bq, gcs, sys.argv[i + 1], ingested)
+
+    # Google Docs: --gdocs <url> (repeat for multiple)
+    for i, arg in enumerate(sys.argv):
+        if arg == "--gdocs" and i + 1 < len(sys.argv):
+            ingest_gdoc(bq, gcs, sys.argv[i + 1], ingested)
 
     print("\n" + "=" * 60)
     print("Sample query:")
@@ -762,6 +900,9 @@ def run():
 
 
 if __name__ == "__main__":
+    if "--auth-google" in sys.argv:
+        auth_google()
+        sys.exit(0)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise EnvironmentError("Set ANTHROPIC_API_KEY before running.")
     run()

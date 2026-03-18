@@ -1,4 +1,6 @@
 creds.json
+google_oauth_client.json
+google_token.json
 *.pyc
 __pycache__/
 .env
