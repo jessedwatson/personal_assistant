@@ -4,6 +4,7 @@ Conversation ingestion pipeline.
 
 Sources:
   - Cluely  : platform.cluely.com API (live, uses session token from local app)
+  - Granola : api.granola.ai API (live, uses WorkOS token from local app)
 
 BigQuery schema:
   conversations  : ~30-column dimension table, one row per session
@@ -33,8 +34,9 @@ CREDS_PATH   = Path(__file__).parent / "creds.json"
 PROJECT_ID   = "eng-reactor-287421"
 DATASET      = "personal_assistant"
 BUCKET       = "jesse-personal-assistant"
-CLUELY_SESSION_PATH = Path.home() / "Library/Application Support/cluely/user.session"
-ANTHROPIC_MODEL     = "claude-sonnet-4-6"
+CLUELY_SESSION_PATH  = Path.home() / "Library/Application Support/cluely/user.session"
+GRANOLA_ACCOUNTS_PATH = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
+ANTHROPIC_MODEL      = "claude-sonnet-4-6"
 
 # ── GCP clients ────────────────────────────────────────────────────────────────
 
@@ -344,6 +346,9 @@ def get_ingested_ids(bq: bigquery.Client) -> set:
 
 def ingest_cluely(bq: bigquery.Client, gcs: storage.Client, ingested: set):
     print("\n[Cluely] Starting ingestion...")
+    if not CLUELY_SESSION_PATH.exists():
+        print("[Cluely] Session file not found, skipping.")
+        return
     token    = load_cluely_token()
     sessions = fetch_sessions(token)
     print(f"[Cluely] Found {len(sessions)} sessions, {len(ingested)} already ingested")
@@ -448,6 +453,133 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
     print(f"\n[Re-enrich] Truncating conversations table and reloading {len(new_conv_rows)} rows...")
     batch_load(bq, "conversations", new_conv_rows, bigquery.WriteDisposition.WRITE_TRUNCATE)
     print("[Re-enrich] Done.")
+
+
+# ── Granola ingestion ──────────────────────────────────────────────────────────
+
+def load_granola_token() -> str:
+    data = json.loads(GRANOLA_ACCOUNTS_PATH.read_text())
+    account = json.loads(data["accounts"])[0]
+    return json.loads(account["tokens"])["access_token"]
+
+
+def granola_post(token: str, endpoint: str, payload: dict) -> any:
+    r = requests.post(
+        f"https://api.granola.ai/v1/{endpoint}",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_granola_documents(token: str) -> list[dict]:
+    """Return all documents (owned + shared) using document-set + batch fetch."""
+    doc_set = granola_post(token, "get-document-set", {})
+    all_ids = list(doc_set["documents"].keys())
+    if not all_ids:
+        return []
+    data = granola_post(token, "get-documents-batch", {"document_ids": all_ids})
+    return [d for d in data.get("docs", []) if isinstance(d, dict)]
+
+
+def fetch_granola_transcript(token: str, doc_id: str) -> list[dict]:
+    result = granola_post(token, "get-document-transcript", {"document_id": doc_id})
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set):
+    print("\n[Granola] Starting ingestion...")
+    token = load_granola_token()
+    docs  = fetch_granola_documents(token)
+    print(f"[Granola] Found {len(docs)} documents, {len(ingested)} already ingested")
+
+    for doc in docs:
+        did   = doc["id"]
+        title = doc.get("title") or ""
+
+        if did in ingested:
+            print(f"  skip {title or did} — already ingested")
+            continue
+
+        # Pull calendar event title as fallback
+        if not title:
+            cal = doc.get("google_calendar_event") or {}
+            title = cal.get("summary", "") if isinstance(cal, dict) else ""
+        if not title:
+            print(f"  skip {did} — no title")
+            continue
+
+        print(f"\n  Processing: {title}")
+
+        segments = fetch_granola_transcript(token, did)
+        if not segments:
+            print("  empty transcript, skipping")
+            continue
+
+        # Granola uses source="microphone" for Jesse, "system" for others
+        transcript_text = "\n".join(
+            f"[{'mic' if s.get('source') == 'microphone' else 'system'}]: {s.get('text','').strip()}"
+            for s in segments if s.get("text", "").strip()
+        )
+
+        print("  [Claude] enriching...")
+        meta = enrich(transcript_text, title)
+        print(f"    topic:        {meta.get('topic','')[:80]}")
+        print(f"    participants: {meta.get('participants')}")
+        print(f"    companies:    {meta.get('companies')}")
+        print(f"    category:     {meta.get('category')} / {meta.get('subcategory')}")
+        print(f"    hiring:       {meta.get('hiring_related')} — {meta.get('hiring_company')}")
+        print(f"    follow_up:    {meta.get('follow_up_required')}")
+
+        gcs_path = upload_raw(gcs, {"document": doc, "transcript": segments}, "granola", did)
+
+        # Duration from first/last segment timestamps
+        started_at = doc.get("created_at")
+        ended_at   = doc.get("updated_at")
+        if segments:
+            started_at = segments[0].get("start_timestamp") or started_at
+            ended_at   = segments[-1].get("end_timestamp") or ended_at
+
+        duration = None
+        if started_at and ended_at:
+            try:
+                s = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                e = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                duration = round((e - s).total_seconds() / 60, 1)
+            except ValueError:
+                pass
+
+        msg_rows = []
+        for i, seg in enumerate(segments):
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            role = "Jesse" if seg.get("source") == "microphone" else "other"
+            msg_rows.append({
+                "conversation_id": did,
+                "timestamp":       seg.get("start_timestamp"),
+                "role":            role,
+                "content":         text,
+                "sequence":        i,
+                "word_count":      len(text.split()),
+            })
+
+        total_words = sum(r["word_count"] for r in msg_rows)
+
+        # Reuse build_conv_row via a compatible session dict
+        session = {"startedAt": started_at, "endedAt": ended_at, "title": title}
+        conv_row = build_conv_row(did, session, meta, gcs_path, len(msg_rows), total_words)
+        conv_row["source"] = "granola"
+        conv_row["duration_minutes"] = duration
+
+        batch_load(bq, "conversations", [conv_row])
+        batch_load(bq, "messages", msg_rows)
+
+    print("\n[Granola] Done.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -557,6 +689,9 @@ def run():
 
     # Cluely
     ingest_cluely(bq, gcs, ingested)
+
+    # Granola
+    ingest_granola(bq, gcs, ingested)
 
     # Claude reports: --report path/to/file.md
     if "--report" in sys.argv:
