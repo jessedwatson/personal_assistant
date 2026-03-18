@@ -178,17 +178,28 @@ ENRICHMENT_SCHEMA = """{
 }"""
 
 
+def _load_org_context() -> str:
+    org_path = Path(__file__).parent / "org_context.md"
+    if org_path.exists():
+        return "\n\n" + org_path.read_text()
+    return ""
+
+
 def enrich(transcript_text: str, title: str) -> dict:
     client = Anthropic()
+    org_context = _load_org_context()
     resp = client.messages.create(
         model=ANTHROPIC_MODEL,
         max_tokens=2048,
         system=(
             "You are a conversation analyst. Extract structured metadata from transcripts.\n"
             "The transcript uses [mic] for the local speaker (Jesse Watson) and [system] for other speakers.\n"
-            "Extract proper names, companies, and all other fields from the text content itself.\n\n"
+            "Normalize all people's names to their canonical full names using the org chart below as the ground truth.\n"
+            "For example: 'Gustav' → 'Gustaf Bellstam', 'Sharwaree' → 'Smita Mahapatra', 'Thomasw' → 'Thomas Watkins'.\n"
+            "If a name cannot be matched to the org chart, use the name as heard but clean up obvious transcription errors.\n\n"
             "Return ONLY valid JSON matching this exact schema — no markdown, no explanation:\n"
             + ENRICHMENT_SCHEMA
+            + org_context
         ),
         messages=[{"role": "user", "content": f"Title: {title}\n\nTranscript:\n{transcript_text[:14000]}"}],
     )
@@ -417,7 +428,7 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
     """Re-extract all metadata. Truncates and reloads conversations table."""
     print("\n[Re-enrich] Loading existing conversation IDs...")
     rows = list(bq.query(
-        f"SELECT conversation_id, title FROM `{PROJECT_ID}.{DATASET}.conversations`"
+        f"SELECT conversation_id, title, source FROM `{PROJECT_ID}.{DATASET}.conversations`"
     ).result())
     print(f"[Re-enrich] {len(rows)} conversations to re-enrich")
 
@@ -425,29 +436,72 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
     new_conv_rows = []
 
     for row in rows:
-        sid   = row.conversation_id
-        title = row.title or ""
-        print(f"\n  Re-enriching: {title or sid}")
+        sid    = row.conversation_id
+        title  = row.title or ""
+        source = row.source or "cluely"
+        print(f"\n  Re-enriching [{source}]: {title or sid}")
 
-        blob = bucket.blob(f"transcripts/cluely/{sid}.json")
-        raw  = json.loads(blob.download_as_text())
-        session   = raw.get("session", {})
-        segments  = raw.get("transcript", [])
+        # Locate the raw file in GCS — try source-specific path first
+        raw = None
+        gcs_path = None
+        for candidate in [
+            f"transcripts/{source}/{sid}.json",
+            f"transcripts/{source}/{sid}.md",
+            f"transcripts/cluely/{sid}.json",
+        ]:
+            blob = bucket.blob(candidate)
+            try:
+                raw_text = blob.download_as_text()
+                gcs_path = f"gs://{BUCKET}/{candidate}"
+                raw = json.loads(raw_text) if candidate.endswith(".json") else {"markdown": raw_text}
+                break
+            except Exception:
+                continue
 
-        transcript_text = "\n".join(
-            f"[{s.get('role','')}]: {s.get('text','').strip()}"
-            for s in segments if s.get("text","").strip()
-        )
+        if raw is None:
+            print(f"  [warn] no raw file found for {sid}, skipping")
+            continue
+
+        # Extract transcript text based on source
+        if source == "granola":
+            segments = raw.get("transcript", [])
+            transcript_text = "\n".join(
+                f"[{'mic' if s.get('source') == 'microphone' else 'system'}]: {s.get('text','').strip()}"
+                for s in segments if s.get("text","").strip()
+            )
+            started_at = segments[0].get("start_timestamp") if segments else raw.get("document", {}).get("created_at")
+            ended_at   = segments[-1].get("end_timestamp") if segments else raw.get("document", {}).get("updated_at")
+            session    = {"startedAt": started_at, "endedAt": ended_at, "title": title}
+        elif source == "claude":
+            transcript_text = raw.get("markdown", "")
+            session = {"startedAt": None, "endedAt": None, "title": title}
+        else:  # cluely
+            session  = raw.get("session", {})
+            segments = raw.get("transcript", [])
+            transcript_text = "\n".join(
+                f"[{s.get('role','')}]: {s.get('text','').strip()}"
+                for s in segments if s.get("text","").strip()
+            )
 
         meta = enrich(transcript_text, title)
         print(f"    participants: {meta.get('participants')}")
         print(f"    companies:    {meta.get('companies')}")
 
-        msg_count   = sum(1 for s in segments if s.get("text","").strip())
-        word_count  = sum(len(s.get("text","").split()) for s in segments if s.get("text","").strip())
-        gcs_path    = f"gs://{BUCKET}/transcripts/cluely/{sid}.json"
+        if source == "granola":
+            segments = raw.get("transcript", [])
+            msg_count  = sum(1 for s in segments if s.get("text","").strip())
+            word_count = sum(len(s.get("text","").split()) for s in segments if s.get("text","").strip())
+        elif source == "claude":
+            words = transcript_text.split()
+            msg_count, word_count = 1, len(words)
+        else:
+            segments   = raw.get("transcript", [])
+            msg_count  = sum(1 for s in segments if s.get("text","").strip())
+            word_count = sum(len(s.get("text","").split()) for s in segments if s.get("text","").strip())
 
-        new_conv_rows.append(build_conv_row(sid, session, meta, gcs_path, msg_count, word_count))
+        conv_row = build_conv_row(sid, session, meta, gcs_path, msg_count, word_count)
+        conv_row["source"] = source
+        new_conv_rows.append(conv_row)
 
     # Truncate and reload conversations table (avoids streaming buffer issue)
     print(f"\n[Re-enrich] Truncating conversations table and reloading {len(new_conv_rows)} rows...")
