@@ -9,35 +9,36 @@ Jesse Watson — data/analytics leader at Remitly, working on pricing platform, 
 
 ## Architecture
 
-This project uses a **multi-agent architecture**. The orchestrator (main personal assistant) delegates to specialized subagents, each with its own MCP tools and scope. The orchestrator routes requests, synthesizes results, and maintains overall context.
+This project uses a **multi-agent architecture**. Two categories of agents:
+
+1. **Core agents** — orchestrator + ingestion/query agents that form the always-available assistant
+2. **On-demand subagents** — triggered only by explicit user request; never run proactively
 
 ```
 Orchestrator (personal assistant)
-├── Confluence subagent  — reads/searches Remitly Confluence via Atlassian MCP; ingests pages into BigQuery [BUILT]
-├── Data subagent        — queries BigQuery, runs ingestion pipeline [BUILT]
-├── Slack subagent       — ingests Slack messages [NOT BUILT]
-└── Email subagent       — ingests Gmail/email [NOT BUILT]
+├── Ingestion Agent (scheduled/triggered — writes to BQ+GCS)
+│    ├── Granola subagent  — proactive, checks for new meeting transcripts [BUILT]
+│    └── Cluely subagent   — proactive, checks for new sessions [BUILT]
+└── Query/Context Agent (on demand — reads from BQ+GCS) [NOT BUILT]
+
+On-demand subagents (triggered by user request only — never proactive):
+├── Confluence subagent  — Atlassian MCP, reads/searches Remitly Confluence [BUILT]
+├── Slack subagent       — reads Slack messages [NOT BUILT]
+└── Email subagent       — reads Gmail [NOT BUILT]
 ```
 
-Each subagent has its own MCP tools:
-- **Confluence subagent**: Atlassian MCP (`mcp-atlassian` via uvx) — `confluence_search`, `confluence_get_page`, etc.
-- **Data subagent**: BigQuery + GCS via `creds.json` service account; runs `pipeline.py`
-- **Slack subagent**: Slack API (not configured yet)
-- **Email subagent**: Gmail API (not configured yet)
+**Important:** The Ingestion Agent only proactively checks Granola and Cluely. Confluence, Slack, and Email are pull-on-demand only — they are never ingested automatically.
 
-### Data subagent — ingestion pipeline (`pipeline.py`)
-Pulls conversations and documents from various sources, enriches them with Claude (claude-sonnet-4-6), and stores them in BigQuery + GCS.
+### Ingestion Agent — `pipeline.py`
+Proactively pulls meeting notes from Granola and Cluely, enriches with Claude (claude-sonnet-4-6), and stores in BigQuery + GCS. Also has manual/one-off loaders for Claude reports and Google Docs.
 
-**Sources currently built:**
-- `cluely` — platform.cluely.com API, session token from `~/Library/Application Support/cluely/user.session`
+**Sources (proactive):**
 - `granola` — api.granola.ai API, WorkOS token from `~/Library/Application Support/Granola/stored-accounts.json`
+- `cluely` — platform.cluely.com API, session token from `~/Library/Application Support/cluely/user.session`
+
+**Sources (manual/one-off, not proactive):**
 - `claude` — Claude conversation reports (markdown files)
 - `gdocs` — Google Docs via OAuth (`google_oauth_client.json` + `google_token.json`)
-
-**Sources planned (owned by other subagents):**
-- `confluence` — delegated to Confluence subagent
-- `slack` — delegated to Slack subagent
-- `email` — delegated to Email subagent
 
 **BigQuery tables:**
 - `conversations` — ~30-column dimension table, one row per session (participants, topics, action items, sentiment, etc.)
@@ -48,8 +49,8 @@ Pulls conversations and documents from various sources, enriches them with Claud
 - Raw transcripts at `gs://jesse-personal-assistant/transcripts/{source}/{id}.json`
 - Markdown versions at `gs://jesse-personal-assistant/transcripts/{source}/{id}.md`
 
-### Confluence subagent — Atlassian MCP
-Reads and searches Remitly Confluence via the Atlassian MCP server. Can ingest pages into BigQuery.
+### Confluence subagent — Atlassian MCP (on demand)
+Reads and searches Remitly Confluence via the Atlassian MCP server. Triggered only when the user asks. Not part of the ingestion pipeline.
 
 MCP configured in `~/.claude.json` (NOT `~/.claude/settings.json`) using `mcp-atlassian` via uvx:
 - Confluence URL: `https://remitly.atlassian.net/wiki`
@@ -71,10 +72,10 @@ Relevant Confluence spaces: `Pricing` (Pricing Analytics), `PricingPromotions` (
 - Anthropic model: `claude-sonnet-4-6`
 
 ## Vision / What's Not Built Yet
-- Slack subagent + ingestion
-- Email subagent + ingestion
-- Scheduled pipeline runs
-- Orchestrator memory layer — query BigQuery to answer questions about past conversations, people, decisions
+- Query/Context Agent — query BigQuery to answer questions about past conversations, people, decisions
+- Slack subagent (on demand)
+- Email subagent (on demand)
+- Scheduled/triggered runs of the Ingestion Agent
 
 ## Session Workflow
 At the end of each session, update this file (CLAUDE.md) with anything significant that was set up or changed. A `Stop` hook in `~/.claude/settings.json` will automatically `git add CLAUDE.md`, commit with "Auto-update session notes", and push — so no manual commit/push needed as long as CLAUDE.md is updated before the session ends.
