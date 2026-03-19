@@ -66,7 +66,14 @@ CLAUDE.md (orchestrator)
 
 ## Session Protocol
 
-At the start of every session, read `~/.claude/projects/-Users-jessew-personal-assistant/memory/priorities.md` and follow the Session Protocol defined there: present current priorities, ask Jesse which one to focus on, and flag drift throughout the session.
+**MANDATORY — do this before responding to ANY first message, no exceptions:**
+
+1. Read `~/.claude/projects/-Users-jessew-personal-assistant/memory/priorities.md`
+2. Present the current priorities to Jesse
+3. Ask which one to focus on for this session
+4. Hold that priority as the session focus — flag drift with: "⚠️ Drift check: we're working on [priority] — is this detour intentional?"
+
+Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–3 are complete. Even if the first message is unrelated to priorities, complete the protocol first, then address the message.
 
 ## Session Workflow
 
