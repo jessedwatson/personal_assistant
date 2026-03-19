@@ -1,3 +1,11 @@
+---
+name: query-agent
+description: NOT AVAILABLE. Do not delegate to this agent.
+model: haiku
+---
+# Query Agent (Not Built Yet)
+This agent is a placeholder. Do not use.
+
 # Query Agent
 
 Query BigQuery and GCS for past conversation context — meeting notes, decisions, action items, and discussion history.

@@ -1,3 +1,11 @@
+---
+name: slack-agent
+description: NOT AVAILABLE. Do not delegate to this agent.
+model: haiku
+---
+# Slack Agent (Not Built Yet)
+This agent is a placeholder. Do not use.
+
 # Slack Agent
 
 Search Slack messages and threads relevant to a question.

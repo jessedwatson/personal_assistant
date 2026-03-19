@@ -1,3 +1,9 @@
+---
+name: ingestion-agent
+description: Runs the ingestion pipeline to pull new sessions from Granola and Cluely into BigQuery and GCS. Use when the user asks to ingest new meetings, sync recent Granola transcripts, or sync recent Cluely sessions.
+tools: Bash, Read
+model: inherit
+---
 # Ingestion Agent
 
 Run the ingestion pipeline to pull new sessions from Granola and Cluely into BigQuery and GCS.

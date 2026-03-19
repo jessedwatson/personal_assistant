@@ -1,3 +1,11 @@
+---
+name: email-agent
+description: NOT AVAILABLE. Do not delegate to this agent.
+model: haiku
+---
+# Email Agent (Not Built Yet)
+This agent is a placeholder. Do not use.
+
 # Email Agent
 
 Search Gmail for relevant emails and threads.

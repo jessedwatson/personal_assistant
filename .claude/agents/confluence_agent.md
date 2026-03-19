@@ -1,3 +1,9 @@
+---
+name: confluence-agent
+description: Searches and retrieves content from Remitly Confluence. Use when the question involves team docs, specs, runbooks, decision records, project status, team structure, Remitly processes, or org information.
+tools: mcp__atlassian__confluence_search, mcp__atlassian__confluence_get_page, mcp__atlassian__confluence_get_page_children
+model: inherit
+---
 # Confluence Agent
 
 Search and retrieve content from Remitly Confluence via the Atlassian MCP server.
