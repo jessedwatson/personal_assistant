@@ -17,6 +17,7 @@ Invoke subagents based on the question. Fan out to multiple in parallel when rel
 | Ingest new Granola/Cluely sessions | `ingestion_agent` |
 | Slack threads, messages | `slack_agent` (not built) |
 | Email | `email_agent` (not built) |
+| Improve agent architecture, Claude Code best practices | `claude_advisor_agent` |
 
 **Example:** "What's the status of pricing platform?"
 → spawn `confluence_agent` + `query_agent` in parallel → synthesize into one answer.
@@ -32,7 +33,8 @@ CLAUDE.md (orchestrator)
     ├── ingestion_agent.md    — runs Granola/Cluely pipeline, writes to BQ+GCS [BUILT]
     ├── query_agent.md        — reads BigQuery/GCS for past conversation context [NOT BUILT]
     ├── slack_agent.md        — searches Slack messages [NOT BUILT]
-    └── email_agent.md        — reads Gmail [NOT BUILT]
+    ├── email_agent.md        — reads Gmail [NOT BUILT]
+    └── claude_advisor_agent.md — audits architecture against latest Claude Code docs [BUILT]
 ```
 
 ## Infrastructure
