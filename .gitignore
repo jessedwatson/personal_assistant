@@ -1,4 +1,5 @@
 creds.json
+.mcp.json
 google_oauth_client.json
 google_token.json
 *.pyc

@@ -19,6 +19,8 @@ Invoke subagents based on the question. Fan out to multiple in parallel when rel
 | Email | `email_agent` (not built) |
 | Improve agent architecture, Claude Code best practices | `claude_advisor_agent` |
 
+**Default delegation rule:** When answering any question about Remitly processes, people, teams, decisions, projects, or anything that might have internal documentation — always invoke `confluence_agent` to check for relevant Confluence context before answering. When in doubt, delegate.
+
 **Example:** "What's the status of pricing platform?"
 → spawn `confluence_agent` + `query_agent` in parallel → synthesize into one answer.
 
