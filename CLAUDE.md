@@ -42,14 +42,15 @@ Pulls conversations and documents from various sources, enriches them with Claud
 - GCP credentials: `creds.json` (service account)
 - Anthropic model: `claude-sonnet-4-6`
 
-## Confluence Access
-Confluence MCP is configured in `~/.claude/settings.json` under `mcpServers.confluence`:
-- Base URL: `https://remitly.atlassian.net/wiki`
+## Atlassian Access (Jira + Confluence)
+MCP configured in `~/.claude/settings.json` under `mcpServers.atlassian` using `mcp-atlassian` via uvx:
+- Confluence URL: `https://remitly.atlassian.net/wiki`
+- Jira URL: `https://remitly.atlassian.net/`
 - Username: `jessew@remitly.com`
-- Token: stored in settings.json
-- Default space: `AC`
+- Token: stored in settings.json (same token works for both)
+- uvx path: `/Users/jessew/Library/Python/3.9/bin/uvx`
 
-Relevant spaces: `Pricing` (Pricing Analytics), `PricingPromotions` (Pricing & Promotions), `AN` (Analytics), `DP1` (Analytics Engineering), `MLE` (Machine Learning), `PAX` (Payments Acceptance).
+Relevant Confluence spaces: `Pricing` (Pricing Analytics), `PricingPromotions` (Pricing & Promotions), `AN` (Analytics), `DP1` (Analytics Engineering), `MLE` (Machine Learning), `PAX` (Payments Acceptance).
 
 Can also query Confluence directly via REST API using the token from settings.json.
 
