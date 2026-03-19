@@ -64,6 +64,10 @@ CLAUDE.md (orchestrator)
 - `email_agent` — Gmail reader
 - Scheduled/triggered runs of the ingestion agent
 
+## Session Protocol
+
+At the start of every session, read `~/.claude/projects/-Users-jessew-personal-assistant/memory/priorities.md` and follow the Session Protocol defined there: present current priorities, ask Jesse which one to focus on, and flag drift throughout the session.
+
 ## Session Workflow
 
 At the end of each session, update this file (CLAUDE.md) with anything significant that was set up or changed. A `Stop` hook in `~/.claude/settings.json` will automatically `git add CLAUDE.md`, commit with "Auto-update session notes", and push.
