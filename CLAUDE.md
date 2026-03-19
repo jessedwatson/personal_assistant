@@ -61,5 +61,8 @@ Can also query Confluence directly via REST API using the token from settings.js
 - Confluence page ingestion into BigQuery
 - Scheduled pipeline runs
 
+## Session Workflow
+At the end of each session, update this file (CLAUDE.md) with anything significant that was set up or changed. A `Stop` hook in `~/.claude/settings.json` will automatically `git add CLAUDE.md`, commit with "Auto-update session notes", and push — so no manual commit/push needed as long as CLAUDE.md is updated before the session ends.
+
 ## Current Constraints
 - GitHub MCP is NOT set up yet. Do not suggest or include it in any plans.
