@@ -33,7 +33,7 @@ CLAUDE.md (orchestrator)
 └── .claude/agents/
     ├── confluence_agent.md   — searches Remitly Confluence via Atlassian MCP [BUILT]
     ├── ingestion_agent.md    — runs Granola/Cluely pipeline, writes to BQ+GCS [BUILT]
-    ├── query_agent.md        — reads BigQuery/GCS for past conversation context [NOT BUILT]
+    ├── query_agent.md        — reads BigQuery/GCS for past conversation context [BUILT]
     ├── slack_agent.md        — searches Slack messages [NOT BUILT]
     ├── email_agent.md        — reads Gmail [NOT BUILT]
     └── claude_advisor_agent.md — audits architecture against latest Claude Code docs [BUILT]
@@ -59,7 +59,6 @@ CLAUDE.md (orchestrator)
 
 ## What's Not Built Yet
 
-- `query_agent` — BigQuery/GCS reader for past conversation context
 - `slack_agent` — Slack reader
 - `email_agent` — Gmail reader
 - Scheduled/triggered runs of the ingestion agent
