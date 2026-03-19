@@ -9,25 +9,24 @@ Jesse Watson — data/analytics leader at Remitly, working on pricing platform, 
 
 ## Architecture
 
-This project uses a **multi-agent architecture**. Two categories of agents:
+This project uses a **multi-agent architecture** with two core agents:
 
-1. **Core agents** — orchestrator + ingestion/query agents that form the always-available assistant
-2. **On-demand subagents** — triggered only by explicit user request; never run proactively
+1. **Ingestion Agent** — proactively pulls from Granola and Cluely, writes to BQ+GCS
+2. **Query Agent** — triggered on user questions; fans out to all available sources and synthesizes a single answer
 
 ```
 Orchestrator (personal assistant)
 ├── Ingestion Agent (scheduled/triggered — writes to BQ+GCS)
 │    ├── Granola subagent  — proactive, checks for new meeting transcripts [BUILT]
 │    └── Cluely subagent   — proactive, checks for new sessions [BUILT]
-└── Query/Context Agent (on demand — reads from BQ+GCS) [NOT BUILT]
-
-On-demand subagents (triggered by user request only — never proactive):
-├── Confluence subagent  — Atlassian MCP, reads/searches Remitly Confluence [BUILT]
-├── Slack subagent       — reads Slack messages [NOT BUILT]
-└── Email subagent       — reads Gmail [NOT BUILT]
+└── Query Agent (on demand — fans out to all sources, synthesizes answer) [NOT BUILT]
+     ├── BigQuery/GCS      — past conversations, transcripts, decisions [BUILT storage]
+     ├── Confluence        — Atlassian MCP, reads/searches Remitly Confluence [BUILT]
+     ├── Slack             — reads Slack messages [NOT BUILT]
+     └── Email             — reads Gmail [NOT BUILT]
 ```
 
-**Important:** The Ingestion Agent only proactively checks Granola and Cluely. Confluence, Slack, and Email are pull-on-demand only — they are never ingested automatically.
+**Important:** The Ingestion Agent only proactively checks Granola and Cluely. The Query Agent is triggered on demand by a user question — it fans out to all available sources in parallel, then synthesizes results into a single answer. Confluence, Slack, and Email are never ingested automatically; they are always queried live.
 
 ### Ingestion Agent — `pipeline.py`
 Proactively pulls meeting notes from Granola and Cluely, enriches with Claude (claude-sonnet-4-6), and stores in BigQuery + GCS. Also has manual/one-off loaders for Claude reports and Google Docs.
@@ -72,7 +71,7 @@ Relevant Confluence spaces: `Pricing` (Pricing Analytics), `PricingPromotions` (
 - Anthropic model: `claude-sonnet-4-6`
 
 ## Vision / What's Not Built Yet
-- Query/Context Agent — query BigQuery to answer questions about past conversations, people, decisions
+- Query Agent — fan-out orchestrator that queries all sources (BQ/GCS, Confluence, Slack, Email) in parallel and synthesizes a single answer
 - Slack subagent (on demand)
 - Email subagent (on demand)
 - Scheduled/triggered runs of the Ingestion Agent
