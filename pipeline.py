@@ -18,16 +18,28 @@ Re-enrichment note:
   We avoid this by using batch load (load_table_from_json with WRITE_TRUNCATE)
   for the full re-enrich pass instead of per-row UPDATEs.
 """
+import argparse
+import hashlib
 import json
+import logging
 import os
-import sys
-from datetime import datetime
+import re
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import requests
 from anthropic import Anthropic
 from google.cloud import bigquery, storage
 from google.oauth2 import service_account
+
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 CREDS_PATH   = Path(__file__).parent / "creds.json"
@@ -42,7 +54,7 @@ ANTHROPIC_MODEL       = "claude-sonnet-4-6"
 
 # ── GCP clients ────────────────────────────────────────────────────────────────
 
-def _creds():
+def _creds() -> service_account.Credentials:
     return service_account.Credentials.from_service_account_file(
         str(CREDS_PATH),
         scopes=[
@@ -51,98 +63,158 @@ def _creds():
         ],
     )
 
-def get_bq():  return bigquery.Client(project=PROJECT_ID, credentials=_creds())
-def get_gcs(): return storage.Client(project=PROJECT_ID, credentials=_creds())
+def get_bq() -> bigquery.Client:  return bigquery.Client(project=PROJECT_ID, credentials=_creds())
+def get_gcs() -> storage.Client: return storage.Client(project=PROJECT_ID, credentials=_creds())
 
 # ── BigQuery schema ─────────────────────────────────────────────────────────────
-# S = STRING convenience alias
-S = lambda name, **kw: bigquery.SchemaField(name, "STRING",  **kw)
-T = lambda name, **kw: bigquery.SchemaField(name, "TIMESTAMP", **kw)
-F = lambda name, **kw: bigquery.SchemaField(name, "FLOAT",   **kw)
-I = lambda name, **kw: bigquery.SchemaField(name, "INTEGER", **kw)
-B = lambda name, **kw: bigquery.SchemaField(name, "BOOLEAN", **kw)
+
+def _sf_string(name: str, **kw) -> bigquery.SchemaField:
+    return bigquery.SchemaField(name, "STRING", **kw)
+
+def _sf_timestamp(name: str, **kw) -> bigquery.SchemaField:
+    return bigquery.SchemaField(name, "TIMESTAMP", **kw)
+
+def _sf_float(name: str, **kw) -> bigquery.SchemaField:
+    return bigquery.SchemaField(name, "FLOAT", **kw)
+
+def _sf_integer(name: str, **kw) -> bigquery.SchemaField:
+    return bigquery.SchemaField(name, "INTEGER", **kw)
+
+def _sf_boolean(name: str, **kw) -> bigquery.SchemaField:
+    return bigquery.SchemaField(name, "BOOLEAN", **kw)
 
 CONVERSATIONS_SCHEMA = [
     # ── Identity ──────────────────────────────────────────────────────────────
-    S("conversation_id",     mode="REQUIRED"),  # stable UUID from source
-    T("date"),                                   # start time
-    S("source"),             # cluely | claude | zoom | email | slack
-    S("title"),              # original title from source
-    F("duration_minutes"),   # end - start in minutes
+    _sf_string("conversation_id",     mode="REQUIRED"),  # stable UUID from source
+    _sf_timestamp("date"),                                # start time
+    _sf_string("source"),             # cluely | claude | zoom | email | slack
+    _sf_string("title"),              # original title from source
+    _sf_float("duration_minutes"),    # end - start in minutes
 
     # ── People & orgs ─────────────────────────────────────────────────────────
-    S("participants"),        # people actively in the conversation, comma-sep
-    S("people_mentioned"),    # names mentioned but not necessarily speaking
-    S("companies"),           # companies / orgs referenced
-    S("roles_mentioned"),     # job titles that came up (VP Pricing, CTO, ...)
+    _sf_string("participants"),        # people actively in the conversation, comma-sep
+    _sf_string("people_mentioned"),    # names mentioned but not necessarily speaking
+    _sf_string("companies"),           # companies / orgs referenced
+    _sf_string("roles_mentioned"),     # job titles that came up (VP Pricing, CTO, ...)
 
     # ── Content classification ─────────────────────────────────────────────────
-    S("category"),    # interview | strategy | coaching | technical | social | admin
-    S("subcategory"), # e.g. "salary negotiation" or "system design"
-    S("domain"),      # finance | technology | career | personal | product | legal
+    _sf_string("category"),    # interview | strategy | coaching | technical | social | admin
+    _sf_string("subcategory"), # e.g. "salary negotiation" or "system design"
+    _sf_string("domain"),      # finance | technology | career | personal | product | legal
 
     # ── Narrative ──────────────────────────────────────────────────────────────
-    S("topic"),       # one-sentence subject line
-    S("summary"),     # 2-3 sentence narrative of what happened and what was decided
+    _sf_string("topic"),       # one-sentence subject line
+    _sf_string("summary"),     # 2-3 sentence narrative of what happened and what was decided
 
     # ── Key content extracted ──────────────────────────────────────────────────
-    S("action_items"),     # things someone committed to do, semicolon-sep
-    S("decisions_made"),   # conclusions reached, semicolon-sep
-    S("open_questions"),   # unresolved issues left hanging, semicolon-sep
-    S("key_quotes"),       # verbatim standout lines, semicolon-sep
+    _sf_string("action_items"),     # things someone committed to do, semicolon-sep
+    _sf_string("decisions_made"),   # conclusions reached, semicolon-sep
+    _sf_string("open_questions"),   # unresolved issues left hanging, semicolon-sep
+    _sf_string("key_quotes"),       # verbatim standout lines, semicolon-sep
 
     # ── Strategy & tech ───────────────────────────────────────────────────────
-    S("strategies"),           # high-level strategic moves discussed
-    S("projects_mentioned"),   # named projects (Warm Fuzzies, pricing ML, ...)
-    S("technologies_mentioned"),# tools / languages / platforms (Python, BigQuery, Claude, ...)
-    S("products_mentioned"),   # commercial products or services (Wise, Remitly, ...)
+    _sf_string("strategies"),             # high-level strategic moves discussed
+    _sf_string("projects_mentioned"),     # named projects (Warm Fuzzies, pricing ML, ...)
+    _sf_string("technologies_mentioned"), # tools / languages / platforms (Python, BigQuery, Claude, ...)
+    _sf_string("products_mentioned"),     # commercial products or services (Wise, Remitly, ...)
 
     # ── Sentiment & tone ──────────────────────────────────────────────────────
-    S("sentiment"),   # positive | neutral | negative | mixed
-    S("urgency"),     # low | medium | high
-    S("formality"),   # casual | professional | formal
+    _sf_string("sentiment"),   # positive | neutral | negative | mixed
+    _sf_string("urgency"),     # low | medium | high
+    _sf_string("formality"),   # casual | professional | formal
 
     # ── Hiring context ────────────────────────────────────────────────────────
-    B("hiring_related"),   # true if this is about a job
-    S("hiring_company"),   # company being discussed for hire
-    S("hiring_role"),      # role title
-    S("hiring_stage"),     # screening | interview | offer | negotiation | rejected | accepted
+    _sf_boolean("hiring_related"),   # true if this is about a job
+    _sf_string("hiring_company"),    # company being discussed for hire
+    _sf_string("hiring_role"),       # role title
+    _sf_string("hiring_stage"),      # screening | interview | offer | negotiation | rejected | accepted
 
     # ── Follow-up & relationships ─────────────────────────────────────────────
-    B("follow_up_required"),
-    S("follow_up_items"),    # specific next steps, semicolon-sep
-    S("relationship_context"), # recruiter | colleague | manager | friend | client | vendor
+    _sf_boolean("follow_up_required"),
+    _sf_string("follow_up_items"),      # specific next steps, semicolon-sep
+    _sf_string("relationship_context"), # recruiter | colleague | manager | friend | client | vendor
 
     # ── Geography & finance ───────────────────────────────────────────────────
-    S("locations_mentioned"),   # cities, countries, offices
-    S("financial_context"),     # salary figures, deal sizes, cost topics mentioned
+    _sf_string("locations_mentioned"),  # cities, countries, offices
+    _sf_string("financial_context"),    # salary figures, deal sizes, cost topics mentioned
 
     # ── Retrieval pointer ─────────────────────────────────────────────────────
-    S("raw_gcs_path"),  # gs://bucket/path/to/raw.json
+    _sf_string("raw_gcs_path"),  # gs://bucket/path/to/raw.json
 
     # ── Computed at ingest ────────────────────────────────────────────────────
-    I("message_count"),  # number of utterances in messages table
-    I("word_count"),     # total words across all messages
+    _sf_integer("message_count"),  # number of utterances in messages table
+    _sf_integer("word_count"),     # total words across all messages
 ]
 
 MESSAGES_SCHEMA = [
-    S("conversation_id", mode="REQUIRED"),
-    T("timestamp"),
-    S("role"),      # Jesse | other | system (normalised from mic/system)
-    S("content"),   # raw utterance text
-    I("sequence"),  # 0-indexed order within conversation
-    I("word_count"),# words in this utterance
+    _sf_string("conversation_id", mode="REQUIRED"),
+    _sf_timestamp("timestamp"),
+    _sf_string("role"),       # Jesse | other | system (normalised from mic/system)
+    _sf_string("content"),    # raw utterance text
+    _sf_integer("sequence"),  # 0-indexed order within conversation
+    _sf_integer("word_count"),# words in this utterance
 ]
 
 
-def ensure_dataset_and_tables(bq: bigquery.Client):
+@dataclass
+class MessageRow:
+    conversation_id: str
+    timestamp: str | None
+    role: str
+    content: str
+    sequence: int
+    word_count: int
+
+
+@dataclass
+class ConversationRow:
+    conversation_id: str
+    date: str | None
+    source: str
+    title: str
+    duration_minutes: float | None
+    participants: str
+    people_mentioned: str
+    companies: str
+    roles_mentioned: str
+    category: str
+    subcategory: str
+    domain: str
+    topic: str
+    summary: str
+    action_items: str
+    decisions_made: str
+    open_questions: str
+    key_quotes: str
+    strategies: str
+    projects_mentioned: str
+    technologies_mentioned: str
+    products_mentioned: str
+    sentiment: str
+    urgency: str
+    formality: str
+    hiring_related: bool
+    hiring_company: str
+    hiring_role: str
+    hiring_stage: str
+    follow_up_required: bool
+    follow_up_items: str
+    relationship_context: str
+    locations_mentioned: str
+    financial_context: str
+    raw_gcs_path: str
+    message_count: int
+    word_count: int
+
+
+def ensure_dataset_and_tables(bq: bigquery.Client) -> None:
     ds_ref = bigquery.Dataset(f"{PROJECT_ID}.{DATASET}")
     ds_ref.location = "US"
     bq.create_dataset(ds_ref, exists_ok=True)
     for table_id, schema in [("conversations", CONVERSATIONS_SCHEMA), ("messages", MESSAGES_SCHEMA)]:
         ref = bq.dataset(DATASET).table(table_id)
         bq.create_table(bigquery.Table(ref, schema=schema), exists_ok=True)
-    print(f"[BQ] Schema ready ({DATASET}.conversations, {DATASET}.messages)")
+    log.info("[BQ] Schema ready (%s.conversations, %s.messages)", DATASET, DATASET)
 
 
 # ── Claude enrichment ──────────────────────────────────────────────────────────
@@ -214,7 +286,7 @@ def enrich(transcript_text: str, title: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        print(f"  [warn] JSON parse failed, using defaults")
+        log.warning("JSON parse failed, using defaults")
         return {}
 
 
@@ -229,7 +301,7 @@ def _bool(meta: dict, key: str) -> bool:
 
 
 def build_conv_row(sid: str, session: dict, meta: dict, gcs_path: str,
-                   msg_count: int, word_count: int) -> dict:
+                   msg_count: int, word_count: int) -> ConversationRow:
     started_at = session.get("startedAt")
     ended_at   = session.get("endedAt")
     duration   = None
@@ -238,45 +310,45 @@ def build_conv_row(sid: str, session: dict, meta: dict, gcs_path: str,
         e = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
         duration = round((e - s).total_seconds() / 60, 1)
 
-    return {
-        "conversation_id":      sid,
-        "date":                 started_at,
-        "source":               "cluely",
-        "title":                session.get("title", ""),
-        "duration_minutes":     duration,
-        "participants":         _str(meta, "participants"),
-        "people_mentioned":     _str(meta, "people_mentioned"),
-        "companies":            _str(meta, "companies"),
-        "roles_mentioned":      _str(meta, "roles_mentioned"),
-        "category":             _str(meta, "category"),
-        "subcategory":          _str(meta, "subcategory"),
-        "domain":               _str(meta, "domain"),
-        "topic":                _str(meta, "topic") or session.get("title", ""),
-        "summary":              _str(meta, "summary"),
-        "action_items":         _str(meta, "action_items"),
-        "decisions_made":       _str(meta, "decisions_made"),
-        "open_questions":       _str(meta, "open_questions"),
-        "key_quotes":           _str(meta, "key_quotes"),
-        "strategies":           _str(meta, "strategies"),
-        "projects_mentioned":   _str(meta, "projects_mentioned"),
-        "technologies_mentioned": _str(meta, "technologies_mentioned"),
-        "products_mentioned":   _str(meta, "products_mentioned"),
-        "sentiment":            _str(meta, "sentiment"),
-        "urgency":              _str(meta, "urgency"),
-        "formality":            _str(meta, "formality"),
-        "hiring_related":       _bool(meta, "hiring_related"),
-        "hiring_company":       _str(meta, "hiring_company"),
-        "hiring_role":          _str(meta, "hiring_role"),
-        "hiring_stage":         _str(meta, "hiring_stage"),
-        "follow_up_required":   _bool(meta, "follow_up_required"),
-        "follow_up_items":      _str(meta, "follow_up_items"),
-        "relationship_context": _str(meta, "relationship_context"),
-        "locations_mentioned":  _str(meta, "locations_mentioned"),
-        "financial_context":    _str(meta, "financial_context"),
-        "raw_gcs_path":         gcs_path,
-        "message_count":        msg_count,
-        "word_count":           word_count,
-    }
+    return ConversationRow(
+        conversation_id=sid,
+        date=started_at,
+        source="cluely",
+        title=session.get("title", ""),
+        duration_minutes=duration,
+        participants=_str(meta, "participants"),
+        people_mentioned=_str(meta, "people_mentioned"),
+        companies=_str(meta, "companies"),
+        roles_mentioned=_str(meta, "roles_mentioned"),
+        category=_str(meta, "category"),
+        subcategory=_str(meta, "subcategory"),
+        domain=_str(meta, "domain"),
+        topic=_str(meta, "topic") or session.get("title", ""),
+        summary=_str(meta, "summary"),
+        action_items=_str(meta, "action_items"),
+        decisions_made=_str(meta, "decisions_made"),
+        open_questions=_str(meta, "open_questions"),
+        key_quotes=_str(meta, "key_quotes"),
+        strategies=_str(meta, "strategies"),
+        projects_mentioned=_str(meta, "projects_mentioned"),
+        technologies_mentioned=_str(meta, "technologies_mentioned"),
+        products_mentioned=_str(meta, "products_mentioned"),
+        sentiment=_str(meta, "sentiment"),
+        urgency=_str(meta, "urgency"),
+        formality=_str(meta, "formality"),
+        hiring_related=_bool(meta, "hiring_related"),
+        hiring_company=_str(meta, "hiring_company"),
+        hiring_role=_str(meta, "hiring_role"),
+        hiring_stage=_str(meta, "hiring_stage"),
+        follow_up_required=_bool(meta, "follow_up_required"),
+        follow_up_items=_str(meta, "follow_up_items"),
+        relationship_context=_str(meta, "relationship_context"),
+        locations_mentioned=_str(meta, "locations_mentioned"),
+        financial_context=_str(meta, "financial_context"),
+        raw_gcs_path=gcs_path,
+        message_count=msg_count,
+        word_count=word_count,
+    )
 
 
 # ── GCS ────────────────────────────────────────────────────────────────────────
@@ -285,20 +357,21 @@ def upload_raw(gcs: storage.Client, data: dict, source: str, sid: str) -> str:
     bucket = gcs.bucket(BUCKET)
     if not bucket.exists():
         bucket = gcs.create_bucket(BUCKET, location="US")
-        print(f"[GCS] Created bucket {BUCKET}")
+        log.info("[GCS] Created bucket %s", BUCKET)
     path = f"transcripts/{source}/{sid}.json"
     bucket.blob(path).upload_from_string(json.dumps(data, indent=2), content_type="application/json")
     gcs_path = f"gs://{BUCKET}/{path}"
-    print(f"[GCS] {gcs_path}")
+    log.info("[GCS] %s", gcs_path)
     return gcs_path
 
 
 # ── BQ batch load (avoids streaming buffer limitations) ────────────────────────
 
-def batch_load(bq: bigquery.Client, table_id: str, rows: list[dict],
-               disposition=bigquery.WriteDisposition.WRITE_APPEND):
+def batch_load(bq: bigquery.Client, table_id: str, rows: list[Any],
+               disposition: bigquery.WriteDisposition = bigquery.WriteDisposition.WRITE_APPEND) -> None:
     if not rows:
         return
+    rows = [asdict(r) if hasattr(r, "__dataclass_fields__") else r for r in rows]
     table_ref = f"{PROJECT_ID}.{DATASET}.{table_id}"
     job_config = bigquery.LoadJobConfig(
         schema=CONVERSATIONS_SCHEMA if table_id == "conversations" else MESSAGES_SCHEMA,
@@ -313,9 +386,9 @@ def batch_load(bq: bigquery.Client, table_id: str, rows: list[dict],
     )
     job.result()
     if job.errors:
-        print(f"[BQ] load errors for {table_id}: {job.errors}")
+        log.error("[BQ] load errors for %s: %s", table_id, job.errors)
     else:
-        print(f"[BQ] Loaded {len(rows)} rows → {table_id}")
+        log.info("[BQ] Loaded %d rows → %s", len(rows), table_id)
 
 
 # ── Cluely ingestion ───────────────────────────────────────────────────────────
@@ -349,7 +422,7 @@ def fetch_transcript(token: str, sid: str) -> list[dict]:
     return r.json()
 
 
-def get_ingested_ids(bq: bigquery.Client) -> set:
+def get_ingested_ids(bq: bigquery.Client) -> set[str]:
     try:
         return {r.conversation_id for r in
                 bq.query(f"SELECT conversation_id FROM `{PROJECT_ID}.{DATASET}.conversations`").result()}
@@ -357,31 +430,31 @@ def get_ingested_ids(bq: bigquery.Client) -> set:
         return set()
 
 
-def ingest_cluely(bq: bigquery.Client, gcs: storage.Client, ingested: set):
-    print("\n[Cluely] Starting ingestion...")
+def ingest_cluely(bq: bigquery.Client, gcs: storage.Client, ingested: set[str]) -> None:
+    log.info("[Cluely] Starting ingestion...")
     if not CLUELY_SESSION_PATH.exists():
-        print("[Cluely] Session file not found, skipping.")
+        log.warning("[Cluely] Session file not found, skipping.")
         return
     token    = load_cluely_token()
     sessions = fetch_sessions(token)
-    print(f"[Cluely] Found {len(sessions)} sessions, {len(ingested)} already ingested")
+    log.info("[Cluely] Found %d sessions, %d already ingested", len(sessions), len(ingested))
 
     for session in sessions:
         sid   = session["id"]
         title = session.get("title", "")
 
         if sid in ingested:
-            print(f"  skip {title or sid} — already ingested")
+            log.debug("  skip %s — already ingested", title or sid)
             continue
         if not title:
-            print(f"  skip {sid} — no title")
+            log.debug("  skip %s — no title", sid)
             continue
 
-        print(f"\n  Processing: {title}")
+        log.info("  Processing: %s", title)
 
         segments = fetch_transcript(token, sid)
         if not segments:
-            print("  empty transcript, skipping")
+            log.debug("  empty transcript, skipping")
             continue
 
         transcript_text = "\n".join(
@@ -389,14 +462,14 @@ def ingest_cluely(bq: bigquery.Client, gcs: storage.Client, ingested: set):
             for s in segments if s.get("text", "").strip()
         )
 
-        print("  [Claude] enriching...")
+        log.debug("  [Claude] enriching...")
         meta = enrich(transcript_text, title)
-        print(f"    topic:        {meta.get('topic','')[:80]}")
-        print(f"    participants: {meta.get('participants')}")
-        print(f"    companies:    {meta.get('companies')}")
-        print(f"    category:     {meta.get('category')} / {meta.get('subcategory')}")
-        print(f"    hiring:       {meta.get('hiring_related')} — {meta.get('hiring_company')}")
-        print(f"    follow_up:    {meta.get('follow_up_required')}")
+        log.debug("    topic:        %s", meta.get("topic", "")[:80])
+        log.debug("    participants: %s", meta.get("participants"))
+        log.debug("    companies:    %s", meta.get("companies"))
+        log.debug("    category:     %s / %s", meta.get("category"), meta.get("subcategory"))
+        log.debug("    hiring:       %s — %s", meta.get("hiring_related"), meta.get("hiring_company"))
+        log.debug("    follow_up:    %s", meta.get("follow_up_required"))
 
         gcs_path = upload_raw(gcs, {"session": session, "transcript": segments}, "cluely", sid)
 
@@ -421,31 +494,31 @@ def ingest_cluely(bq: bigquery.Client, gcs: storage.Client, ingested: set):
         batch_load(bq, "conversations", [conv_row])
         batch_load(bq, "messages", msg_rows)
 
-    print("\n[Cluely] Done.")
+    log.info("[Cluely] Done.")
 
 
 # ── Re-enrich (rebuild conversations table from GCS raw files) ─────────────────
 
-def re_enrich(bq: bigquery.Client, gcs: storage.Client):
+def re_enrich(bq: bigquery.Client, gcs: storage.Client) -> None:
     """Re-extract all metadata. Truncates and reloads conversations table."""
-    print("\n[Re-enrich] Loading existing conversation IDs...")
+    log.info("[Re-enrich] Loading existing conversation IDs...")
     rows = list(bq.query(
         f"SELECT conversation_id, title, source, raw_gcs_path FROM `{PROJECT_ID}.{DATASET}.conversations`"
     ).result())
-    print(f"[Re-enrich] {len(rows)} conversations to re-enrich")
+    log.info("[Re-enrich] %d conversations to re-enrich", len(rows))
 
     bucket = gcs.bucket(BUCKET)
     new_conv_rows = []
 
     for row in rows:
-        sid      = row.conversation_id
-        title    = row.title or ""
-        source   = row.source or "cluely"
+        sid             = row.conversation_id
+        title           = row.title or ""
+        source          = row.source or "cluely"
         stored_gcs_path = row.raw_gcs_path or ""
-        print(f"\n  Re-enriching [{source}]: {title or sid}")
+        log.info("  Re-enriching [%s]: %s", source, title or sid)
 
         # Locate the raw file in GCS — use stored path first, then fallback candidates
-        raw = None
+        raw      = None
         gcs_path = None
         candidates = []
         if stored_gcs_path.startswith(f"gs://{BUCKET}/"):
@@ -466,65 +539,63 @@ def re_enrich(bq: bigquery.Client, gcs: storage.Client):
                 continue
 
         if raw is None:
-            print(f"  [warn] no raw file found for {sid}, skipping")
+            log.warning("  no raw file found for %s, skipping", sid)
             continue
 
         # Extract transcript text based on source
-        if source == "granola":
-            segments = raw.get("transcript", [])
-            transcript_text = "\n".join(
-                f"[{'mic' if s.get('source') == 'microphone' else 'system'}]: {s.get('text','').strip()}"
-                for s in segments if s.get("text","").strip()
-            )
-            started_at = segments[0].get("start_timestamp") if segments else raw.get("document", {}).get("created_at")
-            ended_at   = segments[-1].get("end_timestamp") if segments else raw.get("document", {}).get("updated_at")
-            session    = {"startedAt": started_at, "endedAt": ended_at, "title": title}
-        elif source == "claude":
-            transcript_text = raw.get("markdown", "")
-            session = {"startedAt": None, "endedAt": None, "title": title}
-        else:  # cluely
-            session  = raw.get("session", {})
-            segments = raw.get("transcript", [])
-            transcript_text = "\n".join(
-                f"[{s.get('role','')}]: {s.get('text','').strip()}"
-                for s in segments if s.get("text","").strip()
-            )
+        match source:
+            case "granola":
+                segments = raw.get("transcript", [])
+                transcript_text = "\n".join(
+                    f"[{'mic' if s.get('source') == 'microphone' else 'system'}]: {s.get('text','').strip()}"
+                    for s in segments if s.get("text", "").strip()
+                )
+                started_at = segments[0].get("start_timestamp") if segments else raw.get("document", {}).get("created_at")
+                ended_at   = segments[-1].get("end_timestamp") if segments else raw.get("document", {}).get("updated_at")
+                session    = {"startedAt": started_at, "endedAt": ended_at, "title": title}
+            case "claude":
+                transcript_text = raw.get("markdown", "")
+                session = {"startedAt": None, "endedAt": None, "title": title}
+            case _:  # cluely (and anything else)
+                session  = raw.get("session", {})
+                segments = raw.get("transcript", [])
+                transcript_text = "\n".join(
+                    f"[{s.get('role','')}]: {s.get('text','').strip()}"
+                    for s in segments if s.get("text", "").strip()
+                )
 
         meta = enrich(transcript_text, title)
-        print(f"    participants: {meta.get('participants')}")
-        print(f"    companies:    {meta.get('companies')}")
+        log.debug("    participants: %s", meta.get("participants"))
+        log.debug("    companies:    %s", meta.get("companies"))
 
-        if source == "granola":
-            segments = raw.get("transcript", [])
-            msg_count  = sum(1 for s in segments if s.get("text","").strip())
-            word_count = sum(len(s.get("text","").split()) for s in segments if s.get("text","").strip())
-        elif source == "claude":
-            words = transcript_text.split()
-            msg_count, word_count = 1, len(words)
-        else:
-            segments   = raw.get("transcript", [])
-            msg_count  = sum(1 for s in segments if s.get("text","").strip())
-            word_count = sum(len(s.get("text","").split()) for s in segments if s.get("text","").strip())
+        match source:
+            case "claude":
+                words = transcript_text.split()
+                msg_count, word_count = 1, len(words)
+            case _:  # granola and cluely are identical
+                segments   = raw.get("transcript", [])
+                msg_count  = sum(1 for s in segments if s.get("text", "").strip())
+                word_count = sum(len(s.get("text", "").split()) for s in segments if s.get("text", "").strip())
 
         conv_row = build_conv_row(sid, session, meta, gcs_path, msg_count, word_count)
-        conv_row["source"] = source
+        conv_row.source = source
         new_conv_rows.append(conv_row)
 
     # Truncate and reload conversations table (avoids streaming buffer issue)
-    print(f"\n[Re-enrich] Truncating conversations table and reloading {len(new_conv_rows)} rows...")
+    log.info("[Re-enrich] Truncating conversations table and reloading %d rows...", len(new_conv_rows))
     batch_load(bq, "conversations", new_conv_rows, bigquery.WriteDisposition.WRITE_TRUNCATE)
-    print("[Re-enrich] Done.")
+    log.info("[Re-enrich] Done.")
 
 
 # ── Granola ingestion ──────────────────────────────────────────────────────────
 
 def load_granola_token() -> str:
-    data = json.loads(GRANOLA_ACCOUNTS_PATH.read_text())
+    data    = json.loads(GRANOLA_ACCOUNTS_PATH.read_text())
     account = json.loads(data["accounts"])[0]
     return json.loads(account["tokens"])["access_token"]
 
 
-def granola_post(token: str, endpoint: str, payload: dict) -> any:
+def granola_post(token: str, endpoint: str, payload: dict) -> Any:
     r = requests.post(
         f"https://api.granola.ai/v1/{endpoint}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -552,33 +623,33 @@ def fetch_granola_transcript(token: str, doc_id: str) -> list[dict]:
     return []
 
 
-def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set):
-    print("\n[Granola] Starting ingestion...")
+def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set[str]) -> None:
+    log.info("[Granola] Starting ingestion...")
     token = load_granola_token()
     docs  = fetch_granola_documents(token)
-    print(f"[Granola] Found {len(docs)} documents, {len(ingested)} already ingested")
+    log.info("[Granola] Found %d documents, %d already ingested", len(docs), len(ingested))
 
     for doc in docs:
         did   = doc["id"]
         title = doc.get("title") or ""
 
         if did in ingested:
-            print(f"  skip {title or did} — already ingested")
+            log.debug("  skip %s — already ingested", title or did)
             continue
 
         # Pull calendar event title as fallback
         if not title:
-            cal = doc.get("google_calendar_event") or {}
+            cal   = doc.get("google_calendar_event") or {}
             title = cal.get("summary", "") if isinstance(cal, dict) else ""
         if not title:
-            print(f"  skip {did} — no title")
+            log.debug("  skip %s — no title", did)
             continue
 
-        print(f"\n  Processing: {title}")
+        log.info("  Processing: %s", title)
 
         segments = fetch_granola_transcript(token, did)
         if not segments:
-            print("  empty transcript, skipping")
+            log.debug("  empty transcript, skipping")
             continue
 
         # Granola uses source="microphone" for Jesse, "system" for others
@@ -587,14 +658,14 @@ def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set):
             for s in segments if s.get("text", "").strip()
         )
 
-        print("  [Claude] enriching...")
+        log.debug("  [Claude] enriching...")
         meta = enrich(transcript_text, title)
-        print(f"    topic:        {meta.get('topic','')[:80]}")
-        print(f"    participants: {meta.get('participants')}")
-        print(f"    companies:    {meta.get('companies')}")
-        print(f"    category:     {meta.get('category')} / {meta.get('subcategory')}")
-        print(f"    hiring:       {meta.get('hiring_related')} — {meta.get('hiring_company')}")
-        print(f"    follow_up:    {meta.get('follow_up_required')}")
+        log.debug("    topic:        %s", meta.get("topic", "")[:80])
+        log.debug("    participants: %s", meta.get("participants"))
+        log.debug("    companies:    %s", meta.get("companies"))
+        log.debug("    category:     %s / %s", meta.get("category"), meta.get("subcategory"))
+        log.debug("    hiring:       %s — %s", meta.get("hiring_related"), meta.get("hiring_company"))
+        log.debug("    follow_up:    %s", meta.get("follow_up_required"))
 
         gcs_path = upload_raw(gcs, {"document": doc, "transcript": segments}, "granola", did)
 
@@ -632,15 +703,15 @@ def ingest_granola(bq: bigquery.Client, gcs: storage.Client, ingested: set):
         total_words = sum(r["word_count"] for r in msg_rows)
 
         # Reuse build_conv_row via a compatible session dict
-        session = {"startedAt": started_at, "endedAt": ended_at, "title": title}
+        session  = {"startedAt": started_at, "endedAt": ended_at, "title": title}
         conv_row = build_conv_row(did, session, meta, gcs_path, len(msg_rows), total_words)
-        conv_row["source"] = "granola"
-        conv_row["duration_minutes"] = duration
+        conv_row.source           = "granola"
+        conv_row.duration_minutes = duration
 
         batch_load(bq, "conversations", [conv_row])
         batch_load(bq, "messages", msg_rows)
 
-    print("\n[Granola] Done.")
+    log.info("[Granola] Done.")
 
 
 # ── Google Docs ingestion ──────────────────────────────────────────────────────
@@ -651,16 +722,16 @@ GDOCS_SCOPES = [
 ]
 
 
-def auth_google():
+def auth_google() -> None:
     """One-time OAuth flow — opens browser, saves token to google_token.json."""
     from google_auth_oauthlib.flow import InstalledAppFlow
-    flow = InstalledAppFlow.from_client_secrets_file(str(GDOCS_CLIENT_FILE), GDOCS_SCOPES)
+    flow  = InstalledAppFlow.from_client_secrets_file(str(GDOCS_CLIENT_FILE), GDOCS_SCOPES)
     creds = flow.run_local_server(port=0)
     GDOCS_TOKEN_FILE.write_text(creds.to_json())
-    print(f"[Google] Token saved to {GDOCS_TOKEN_FILE}")
+    log.info("[Google] Token saved to %s", GDOCS_TOKEN_FILE)
 
 
-def _gdocs_creds():
+def _gdocs_creds() -> Any:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     if not GDOCS_TOKEN_FILE.exists():
@@ -673,7 +744,6 @@ def _gdocs_creds():
 
 
 def _doc_id_from_url(url: str) -> str:
-    import re
     m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if not m:
         raise ValueError(f"Could not extract doc ID from URL: {url}")
@@ -683,10 +753,10 @@ def _doc_id_from_url(url: str) -> str:
 def fetch_gdoc_as_markdown(doc_id: str) -> tuple[str, str]:
     """Returns (title, markdown_text) for a Google Doc."""
     from googleapiclient.discovery import build
-    creds = _gdocs_creds()
+    creds   = _gdocs_creds()
     service = build("docs", "v1", credentials=creds, cache_discovery=False)
-    doc = service.documents().get(documentId=doc_id).execute()
-    title = doc.get("title", "Untitled")
+    doc     = service.documents().get(documentId=doc_id).execute()
+    title   = doc.get("title", "Untitled")
 
     # Walk the document body and extract plain text
     lines = []
@@ -695,56 +765,55 @@ def fetch_gdoc_as_markdown(doc_id: str) -> tuple[str, str]:
         if not para:
             continue
         style = para.get("paragraphStyle", {}).get("namedStyleType", "")
-        text = "".join(
+        text  = "".join(
             r.get("textRun", {}).get("content", "")
             for r in para.get("elements", [])
         ).rstrip("\n")
         if not text.strip():
             lines.append("")
             continue
-        if style == "HEADING_1":
-            lines.append(f"# {text}")
-        elif style == "HEADING_2":
-            lines.append(f"## {text}")
-        elif style == "HEADING_3":
-            lines.append(f"### {text}")
-        else:
-            lines.append(text)
+        match style:
+            case "HEADING_1":
+                lines.append(f"# {text}")
+            case "HEADING_2":
+                lines.append(f"## {text}")
+            case "HEADING_3":
+                lines.append(f"### {text}")
+            case _:
+                lines.append(text)
 
     return title, "\n".join(lines)
 
 
-def ingest_gdoc(bq: bigquery.Client, gcs: storage.Client, url: str, ingested: set):
-    import hashlib, re
+def ingest_gdoc(bq: bigquery.Client, gcs: storage.Client, url: str, ingested: set[str]) -> None:
     doc_id = _doc_id_from_url(url)
-    cid = "gdoc-" + hashlib.sha1(doc_id.encode()).hexdigest()[:16]
+    cid    = "gdoc-" + hashlib.sha1(doc_id.encode()).hexdigest()[:16]
 
     if cid in ingested:
-        print(f"[GDoc] Already ingested: {doc_id}")
+        log.debug("[GDoc] Already ingested: %s", doc_id)
         return
 
-    print(f"\n[GDoc] Fetching: {url}")
+    log.info("[GDoc] Fetching: %s", url)
     title, text = fetch_gdoc_as_markdown(doc_id)
-    print(f"  Title: {title}  ({len(text.split())} words)")
+    log.info("  Title: %s  (%d words)", title, len(text.split()))
 
-    sections = re.split(r'\n(?=## )', text)
+    sections = re.split(r"\n(?=## )", text)
     if len(sections) <= 1:
         sections = [text]
 
-    print("  [Claude] enriching...")
+    log.debug("  [Claude] enriching...")
     meta = enrich(text[:14000], title)
-    print(f"    topic:     {meta.get('topic','')[:80]}")
-    print(f"    companies: {meta.get('companies')}")
+    log.debug("    topic:     %s", meta.get("topic", "")[:80])
+    log.debug("    companies: %s", meta.get("companies"))
 
     # Upload raw to GCS
-    bucket = gcs.bucket(BUCKET)
+    bucket    = gcs.bucket(BUCKET)
     blob_name = f"transcripts/gdoc/{doc_id}.md"
     bucket.blob(blob_name).upload_from_string(text, content_type="text/markdown")
-    gcs_path = f"gs://{BUCKET}/{blob_name}"
-    print(f"  [GCS] {gcs_path}")
+    gcs_path  = f"gs://{BUCKET}/{blob_name}"
+    log.info("  [GCS] %s", gcs_path)
 
-    from datetime import timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now      = datetime.now(timezone.utc).isoformat()
     msg_rows = []
     for i, section in enumerate(sections):
         section = section.strip()
@@ -760,46 +829,41 @@ def ingest_gdoc(bq: bigquery.Client, gcs: storage.Client, url: str, ingested: se
         })
 
     total_words = sum(r["word_count"] for r in msg_rows)
-    session = {"startedAt": now, "endedAt": now, "title": title}
-    conv_row = build_conv_row(cid, session, meta, gcs_path, len(msg_rows), total_words)
-    conv_row["source"] = "gdoc"
-    conv_row["duration_minutes"] = None
+    session     = {"startedAt": now, "endedAt": now, "title": title}
+    conv_row    = build_conv_row(cid, session, meta, gcs_path, len(msg_rows), total_words)
+    conv_row.source           = "gdoc"
+    conv_row.duration_minutes = None
 
     batch_load(bq, "conversations", [conv_row])
     batch_load(bq, "messages", msg_rows)
-    print(f"  Done — {len(msg_rows)} sections, {total_words} words")
+    log.info("  Done — %d sections, %d words", len(msg_rows), total_words)
 
-
-# ── Entry point ────────────────────────────────────────────────────────────────
 
 # ── Claude report ingestion ────────────────────────────────────────────────────
 
 def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
-                         path: str, ingested: set):
+                         path: str, ingested: set[str]) -> None:
     """
     Ingest a Claude-generated report (markdown or text file) into BQ + GCS.
     conversation_id  = sha1 of the file path (stable across runs)
     messages         = one row per ## section (or full text if no sections)
     source           = "claude"
     """
-    import hashlib
-
     fpath = Path(path).expanduser().resolve()
     if not fpath.exists():
-        print(f"[Claude report] File not found: {fpath}")
+        log.warning("[Claude report] File not found: %s", fpath)
         return
 
     cid = "claude-" + hashlib.sha1(str(fpath).encode()).hexdigest()[:16]
     if cid in ingested:
-        print(f"[Claude report] Already ingested: {fpath.name}")
+        log.debug("[Claude report] Already ingested: %s", fpath.name)
         return
 
-    print(f"\n[Claude report] Ingesting: {fpath.name}")
+    log.info("[Claude report] Ingesting: %s", fpath.name)
     raw_text = fpath.read_text()
 
     # Split into sections on ## headers; fall back to whole file as one section
-    import re
-    sections = re.split(r'\n(?=## )', raw_text)
+    sections = re.split(r"\n(?=## )", raw_text)
     if len(sections) <= 1:
         sections = [raw_text]
 
@@ -814,10 +878,10 @@ def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
         and not s.strip().startswith("Request:")
     )
 
-    print("  [Claude] enriching...")
+    log.debug("  [Claude] enriching...")
     meta = enrich(enrichment_text, fpath.stem.replace("_", " ").title())
-    print(f"    topic:     {meta.get('topic','')[:80]}")
-    print(f"    companies: {meta.get('companies')}")
+    log.debug("    topic:     %s", meta.get("topic", "")[:80])
+    log.debug("    companies: %s", meta.get("companies"))
 
     # File mtime as the date
     mtime = datetime.fromtimestamp(fpath.stat().st_mtime).isoformat() + "Z"
@@ -829,7 +893,7 @@ def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
     blob_name = f"transcripts/claude/{fpath.stem}.md"
     bucket.blob(blob_name).upload_from_string(raw_text, content_type="text/markdown")
     gcs_path = f"gs://{BUCKET}/{blob_name}"
-    print(f"  [GCS] {gcs_path}")
+    log.info("  [GCS] %s", gcs_path)
 
     # messages: one per section, role = "assistant"
     msg_rows = []
@@ -848,61 +912,78 @@ def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
 
     total_words = sum(r["word_count"] for r in msg_rows)
 
-    # Fake session dict for build_conv_row
-    session = {"startedAt": mtime, "endedAt": mtime, "title": fpath.stem.replace("_", " ").title()}
+    session  = {"startedAt": mtime, "endedAt": mtime, "title": fpath.stem.replace("_", " ").title()}
     conv_row = build_conv_row(cid, session, meta, gcs_path, len(msg_rows), total_words)
-    conv_row["source"] = "claude"
-    conv_row["duration_minutes"] = None
+    conv_row.source           = "claude"
+    conv_row.duration_minutes = None
 
     batch_load(bq, "conversations", [conv_row])
     batch_load(bq, "messages", msg_rows)
-    print(f"  Done — {len(msg_rows)} sections, {total_words} words")
+    log.info("  Done — %d sections, %d words", len(msg_rows), total_words)
 
 
-def run():
-    print("=" * 60)
-    print("PERSONAL ASSISTANT — CONVERSATION INGESTION PIPELINE")
-    print("=" * 60)
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Personal assistant conversation ingestion pipeline."
+    )
+    parser.add_argument(
+        "--re-enrich", action="store_true",
+        help="Re-extract metadata for all stored conversations",
+    )
+    parser.add_argument(
+        "--auth-google", action="store_true",
+        help="One-time OAuth flow for Google Docs access",
+    )
+    parser.add_argument(
+        "--report", action="append", metavar="PATH",
+        help="Ingest a Claude-generated report (repeatable)",
+    )
+    parser.add_argument(
+        "--gdocs", action="append", metavar="URL",
+        help="Ingest a Google Doc by URL (repeatable)",
+    )
+    args = parser.parse_args()
+
+    if args.auth_google:
+        auth_google()
+        return
+
+    if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        raise EnvironmentError("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN before running.")
+
+    log.info("=" * 60)
+    log.info("PERSONAL ASSISTANT — CONVERSATION INGESTION PIPELINE")
+    log.info("=" * 60)
 
     bq  = get_bq()
     gcs = get_gcs()
     ensure_dataset_and_tables(bq)
 
-    if "--re-enrich" in sys.argv:
+    if args.re_enrich:
         re_enrich(bq, gcs)
         return
 
     ingested = get_ingested_ids(bq)
-    print(f"[BQ] Already ingested: {len(ingested)} conversations")
+    log.info("[BQ] Already ingested: %d conversations", len(ingested))
 
-    # Cluely
     ingest_cluely(bq, gcs, ingested)
-
-    # Granola
     ingest_granola(bq, gcs, ingested)
 
-    # Claude reports: --report path/to/file.md  (can repeat)
-    for i, arg in enumerate(sys.argv):
-        if arg == "--report" and i + 1 < len(sys.argv):
-            ingest_claude_report(bq, gcs, sys.argv[i + 1], ingested)
+    for path in (args.report or []):
+        ingest_claude_report(bq, gcs, path, ingested)
 
-    # Google Docs: --gdocs <url> (repeat for multiple)
-    for i, arg in enumerate(sys.argv):
-        if arg == "--gdocs" and i + 1 < len(sys.argv):
-            ingest_gdoc(bq, gcs, sys.argv[i + 1], ingested)
+    for url in (args.gdocs or []):
+        ingest_gdoc(bq, gcs, url, ingested)
 
-    print("\n" + "=" * 60)
-    print("Sample query:")
-    print(f"  SELECT date, source, topic, companies")
-    print(f"  FROM `{PROJECT_ID}.{DATASET}.conversations`")
-    print(f"  ORDER BY date DESC")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("Sample query:")
+    log.info("  SELECT date, source, topic, companies")
+    log.info("  FROM `%s.%s.conversations`", PROJECT_ID, DATASET)
+    log.info("  ORDER BY date DESC")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
-    if "--auth-google" in sys.argv:
-        auth_google()
-        sys.exit(0)
-    if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-        raise EnvironmentError("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN before running.")
-    run()
+    main()
