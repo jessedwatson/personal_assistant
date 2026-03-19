@@ -143,6 +143,30 @@ Known members from meeting transcripts (HAT = likely Hakuna/HAT pricing squad):
 
 ---
 
+## Nick Moiseff's Org — VP, GM Money Movement/Business (under Ankur Sinha)
+
+- **Nick Moiseff** — VP, GM Money Movement/Business (Seattle)
+  - **Allison Mead** — Director, Global Money Movement (Seattle) ← owns payout partner network, upstream feed for partner fee data
+  - Gene Nigro — VP, Business Development (FL Remote)
+  - Ankur Tiwari — VP, GM Remitly Business (Seattle)
+  - Aaron Sim — Director of Business Development, APAC (Singapore)
+  - Michael Bond — Director, Business Development (London)
+  - Sharon Karuga Kinyanjui [C] — Business Development Director, Africa (Kenya Remote)
+  - Shishir Jayant — Director of Strategic Partnerships, New Products (London)
+  - Davis Dominic Parakal — Director, GM KSA (Dubai)
+  - Rafael Robles — Country Manager, Brazil (São Paulo)
+  - David Garcia — Group Product Manager (GBR Remote)
+  - Isaac Durant — Group Product Manager (Seattle)
+  - Tory Scearcy — Group Product Manager (Seattle)
+  - Ben Zion Ben-Basat — Senior Product Manager (Arlington VA)
+  - Elsa Watland — Principal Program Manager (Seattle)
+  - Evan Geilich (On Leave) — Director, GM Treasury & Finance Products (NY Remote)
+  - Enrique Silva (On Leave) — Product Director (Seattle)
+  - Opubor Leslie Akraka [C] — Partner Account Manager, Francophone Africa (Nigeria Remote)
+  - Kelly McDermott — Executive Business Partner (Seattle)
+
+---
+
 ## Notes / gaps to fill
 
 - HAT squad — need to identify Ray, Terry, Kevin, Emily, Dylan (roles and reporting lines)

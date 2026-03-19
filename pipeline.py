@@ -903,6 +903,6 @@ if __name__ == "__main__":
     if "--auth-google" in sys.argv:
         auth_google()
         sys.exit(0)
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise EnvironmentError("Set ANTHROPIC_API_KEY before running.")
+    if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        raise EnvironmentError("Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN before running.")
     run()
