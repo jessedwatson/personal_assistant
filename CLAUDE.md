@@ -55,7 +55,8 @@ CLAUDE.md (orchestrator)
 
 ## Other Scripts
 
-- `pipeline.py` — ingestion agent entry point (Granola + Cluely sources)
+- `pipeline.py` — ingestion agent entry point (Granola + Cluely + local docs/ folder)
+- `docs/` — drop `.txt` files here (exported from Google Docs); auto-ingested on every pipeline run
 - `ingest_partner_fees.py` — one-off loader for Partner Fee Structure xlsx
 - `org_context.md` — Remitly org chart for name normalization during enrichment
 
@@ -73,7 +74,7 @@ CLAUDE.md (orchestrator)
 2. Present the current priorities to Jesse
 3. Ask which one to focus on for this session
 4. Hold that priority as the session focus — flag drift with: "⚠️ Drift check: we're working on [priority] — is this detour intentional?"
-5. Invoke the `ingestion_agent` in the background to check for and ingest any new Granola/Cluely sessions since the last run.
+5. Run `.venv/bin/python pipeline.py` in the background from `/Users/jessew/personal_assistant` to ingest new Granola/Cluely sessions and any new files in `docs/`.
 6. Invoke the `jira_agent` in the background to fetch Jesse's open Jira tickets — present the status table once it returns.
 
 Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–4 are complete. Steps 5 and 6 run in the background — do not wait for them before proceeding with the session.

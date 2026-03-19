@@ -50,6 +50,7 @@ CLUELY_SESSION_PATH   = Path.home() / "Library/Application Support/cluely/user.s
 GRANOLA_ACCOUNTS_PATH = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
 GDOCS_CLIENT_FILE     = Path(__file__).parent / "google_oauth_client.json"
 GDOCS_TOKEN_FILE      = Path(__file__).parent / "google_token.json"
+DOCS_FOLDER           = Path(__file__).parent / "docs"
 ANTHROPIC_MODEL       = "claude-sonnet-4-6"
 
 # ── GCP clients ────────────────────────────────────────────────────────────────
@@ -922,6 +923,22 @@ def ingest_claude_report(bq: bigquery.Client, gcs: storage.Client,
     log.info("  Done — %d sections, %d words", len(msg_rows), total_words)
 
 
+# ── Local docs folder ingestion ────────────────────────────────────────────────
+
+def ingest_folder(bq: bigquery.Client, gcs: storage.Client,
+                  folder: Path, ingested: set[str]) -> None:
+    txt_files = sorted(folder.glob("*.txt"))
+    if not txt_files:
+        log.info("[Docs] No .txt files found in %s", folder)
+        return
+    log.info("[Docs] Found %d .txt files in %s", len(txt_files), folder)
+    for fpath in txt_files:
+        try:
+            ingest_claude_report(bq, gcs, str(fpath), ingested)
+        except Exception as e:
+            log.warning("[Docs] Skipping %s — %s", fpath.name, e)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -943,6 +960,10 @@ def main() -> None:
     parser.add_argument(
         "--gdocs", action="append", metavar="URL",
         help="Ingest a Google Doc by URL (repeatable)",
+    )
+    parser.add_argument(
+        "--folder", action="append", metavar="PATH",
+        help="Ingest all .txt files in a folder (repeatable); docs/ is always scanned automatically",
     )
     args = parser.parse_args()
 
@@ -976,6 +997,12 @@ def main() -> None:
 
     for url in (args.gdocs or []):
         ingest_gdoc(bq, gcs, url, ingested)
+
+    # Always scan the default docs/ folder, plus any --folder args
+    folders = list({DOCS_FOLDER} | {Path(p).expanduser().resolve() for p in (args.folder or [])})
+    for folder in folders:
+        if folder.is_dir():
+            ingest_folder(bq, gcs, folder, ingested)
 
     log.info("=" * 60)
     log.info("Sample query:")
