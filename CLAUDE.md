@@ -71,8 +71,9 @@ CLAUDE.md (orchestrator)
 2. Present the current priorities to Jesse
 3. Ask which one to focus on for this session
 4. Hold that priority as the session focus — flag drift with: "⚠️ Drift check: we're working on [priority] — is this detour intentional?"
+5. Invoke the `ingestion_agent` in the background to check for and ingest any new Granola/Cluely sessions since the last run.
 
-Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–3 are complete. Even if the first message is unrelated to priorities, complete the protocol first, then address the message.
+Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–4 are complete. Step 5 (ingestion) runs in the background — do not wait for it before proceeding.
 
 ## Session Workflow
 
