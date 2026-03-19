@@ -15,6 +15,7 @@ Invoke subagents based on the question. Fan out to multiple in parallel when rel
 | Past meetings, decisions, context | `query_agent` |
 | Remitly docs, specs, team pages | `confluence_agent` |
 | Ingest new Granola/Cluely sessions | `ingestion_agent` |
+| Jira ticket status, create/update tickets | `jira_agent` |
 | Slack threads, messages | `slack_agent` (not built) |
 | Email | `email_agent` (not built) |
 | Improve agent architecture, Claude Code best practices | `claude_advisor_agent` |
@@ -34,6 +35,7 @@ CLAUDE.md (orchestrator)
     ├── confluence_agent.md   — searches Remitly Confluence via Atlassian MCP [BUILT]
     ├── ingestion_agent.md    — runs Granola/Cluely pipeline, writes to BQ+GCS [BUILT]
     ├── query_agent.md        — reads BigQuery/GCS for past conversation context [BUILT]
+    ├── jira_agent.md         — fetches/creates/updates Jesse's Jira tickets via Atlassian MCP [BUILT]
     ├── slack_agent.md        — searches Slack messages [NOT BUILT]
     ├── email_agent.md        — reads Gmail [NOT BUILT]
     └── claude_advisor_agent.md — audits architecture against latest Claude Code docs [BUILT]
@@ -72,8 +74,9 @@ CLAUDE.md (orchestrator)
 3. Ask which one to focus on for this session
 4. Hold that priority as the session focus — flag drift with: "⚠️ Drift check: we're working on [priority] — is this detour intentional?"
 5. Invoke the `ingestion_agent` in the background to check for and ingest any new Granola/Cluely sessions since the last run.
+6. Invoke the `jira_agent` in the background to fetch Jesse's open Jira tickets — present the status table once it returns.
 
-Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–4 are complete. Step 5 (ingestion) runs in the background — do not wait for it before proceeding.
+Do NOT answer Jesse's first question, greet him, or do anything else until steps 1–4 are complete. Steps 5 and 6 run in the background — do not wait for them before proceeding with the session.
 
 ## Session Workflow
 
