@@ -3,5 +3,11 @@
     "allow": [
       "mcp__atlassian__*"
     ]
-  }
+  },
+  "webFetchAllowedDomains": [
+    "docs.claude.ai",
+    "code.claude.com",
+    "anthropic.com",
+    "platform.anthropic.com"
+  ]
 }
